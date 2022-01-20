@@ -3,8 +3,9 @@ from ssd1306 import SSD1306_I2C
 from nrf24 import NRF24L01
 import utime
 from ds1307 import DS1307
-
-
+# Pin assignment from Mas6180c: pin 39 = vsys 5v in[red], pin 29/gp22 = led (open = off)[blue], pin 3 = ground[purple],
+# pin 21/gp16 pdn (open = off)[orange],  Pin 22/gp17 = data [Brown]
+#
 # set the datetime 24th March 2018 at 1:45:21 PM
 #>>> now = (2018, 3, 24, 6, 13, 45, 21, 0)
 #>>> ds.datetime(now)
