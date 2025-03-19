@@ -1,0 +1,257 @@
+import time
+import machine
+import utime
+from machine import Pin, RTC
+
+class WWVBClockDecoder:
+    def __init__(self, signal_pin=4, timezone_offset=-5):  # Default to EST
+        """Initialize the WWVB atomic clock decoder.
+        
+        Args:
+            signal_pin: GPIO pin connected to the WWVB receiver
+            timezone_offset: Hours offset from UTC (EST = -5, CST = -6, MST = -7, PST = -8)
+        """
+        self.signal_pin = Pin(signal_pin, Pin.IN)
+        self.timezone_offset = timezone_offset
+        self.rtc = RTC()
+        self.last_edge = 0
+        self.bits = []
+        self.current_second = 0
+        self.time_data = {
+            'minute': 0,
+            'hour': 0,
+            'day': 1,
+            'month': 1,
+            'year': 2023,
+            'doy': 1,  # Day of year (1-366)
+            'dst': 0,   # Daylight Saving Time indicator
+            'leap_year': 0  # Leap year indicator
+        }
+        
+        # Set up interrupt on signal pin
+        self.signal_pin.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, handler=self._edge_detected)
+    
+    def _edge_detected(self, pin):
+        """Interrupt handler for signal edges - WWVB specific"""
+        now = utime.ticks_ms()
+        duration = utime.ticks_diff(now, self.last_edge)
+        self.last_edge = now
+        
+        # WWVB has three pulse widths:
+        # - 0.2s low + 0.8s high = binary '0'
+        # - 0.5s low + 0.5s high = binary '1'
+        # - 0.8s low + 0.2s high = position marker
+        # We detect the pulse width to determine bit value
+        
+        # Only process falling edges (end of pulses)
+        if pin.value() == 0:  # Falling edge
+            if 750 <= duration <= 850:  # ~800ms pulse
+                self.bits.append(0)  # Binary '0'
+            elif 450 <= duration <= 550:  # ~500ms pulse
+                self.bits.append(1)  # Binary '1'
+            elif 150 <= duration <= 250:  # ~200ms pulse
+                # This is a position marker, not a data bit
+                self.current_second += 1
+                
+                # Check if we have a complete frame (60 seconds)
+                if self.current_second >= 60:
+                    self._process_frame()
+                    self.bits = []
+                    self.current_second = 0
+    
+    def _process_frame(self):
+        """Process a complete WWVB frame (60 bits)"""
+        if len(self.bits) < 40:  # We need at least 40 data bits
+            print("Incomplete frame, discarding")
+            return
+        
+        try:
+            # WWVB time code format (specific positions for each data element)
+            # Note: Some bits are ignored as they are position markers or reserved
+            
+            # Minutes (bits 1-8, BCD format)
+            minute_units = self._extract_bcd(self.bits, 1, 4)
+            minute_tens = self._extract_bcd(self.bits, 5, 8)
+            minute = minute_tens * 10 + minute_units
+            
+            # Hours (bits 12-19, BCD format)
+            hour_units = self._extract_bcd(self.bits, 12, 15)
+            hour_tens = self._extract_bcd(self.bits, 16, 19)
+            hour = hour_tens * 10 + hour_units
+            
+            # Day of year (bits 22-39, BCD format)
+            doy_units = self._extract_bcd(self.bits, 22, 25)
+            doy_tens = self._extract_bcd(self.bits, 26, 29)
+            doy_hundreds = self._extract_bcd(self.bits, 30, 33)
+            doy = doy_hundreds * 100 + doy_tens * 10 + doy_units
+            
+            # Year (bits 45-54, BCD format, last two digits only)
+            year_units = self._extract_bcd(self.bits, 45, 48)
+            year_tens = self._extract_bcd(self.bits, 49, 52)
+            year = 2000 + year_tens * 10 + year_units  # Assuming 21st century
+            
+            # DST indicator (bits 55-56)
+            dst = 0
+            if self.bits[55] == 1 and self.bits[56] == 0:
+                dst = 1  # DST in effect
+            elif self.bits[55] == 0 and self.bits[56] == 1:
+                dst = -1  # DST ends today
+            elif self.bits[55] == 1 and self.bits[56] == 1:
+                dst = 2  # DST begins today
+            
+            # Leap second warning (bit 56)
+            leap_second = self.bits[57] if len(self.bits) > 57 else 0
+            
+            # Convert day of year to month and day
+            month, day = self._doy_to_month_day(doy, year)
+            
+            # Validate time data
+            if 0 <= minute <= 59 and 0 <= hour <= 23 and 1 <= doy <= 366 and 1 <= month <= 12 and 1 <= day <= 31:
+                # Apply timezone offset
+                utc_hour = hour
+                hour = (hour + self.timezone_offset) % 24
+                
+                # Apply DST if active
+                if dst == 1:  # DST in effect
+                    hour = (hour + 1) % 24
+                
+                # Update RTC (using 0-6 for weekday where 0 is Monday)
+                weekday = self._calculate_weekday(year, month, day)
+                self.rtc.datetime((year, month, day, weekday, hour, minute, 0, 0))
+                print(f"Time synchronized: {year}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}")
+                print(f"Day of year: {doy}, DST status: {dst}")
+                
+                # Store current values
+                self.time_data = {
+                    'minute': minute,
+                    'hour': hour,
+                    'day': day,
+                    'month': month,
+                    'year': year,
+                    'doy': doy,
+                    'dst': dst,
+                    'leap_year': self._is_leap_year(year)
+                }
+            else:
+                print(f"Invalid time data: {minute}:{hour} {doy}/{year}")
+                
+        except Exception as e:
+            print(f"Error decoding WWVB time data: {e}")
+    
+    def _extract_bcd(self, bits, start, end):
+        """Extract BCD value from bits[start:end+1]"""
+        value = 0
+        weight = 1
+        
+        for i in range(end, start - 1, -1):
+            if i < len(bits) and bits[i] == 1:
+                value += weight
+            weight *= 2
+            
+        return value
+    
+    def _is_leap_year(self, year):
+        """Check if year is a leap year"""
+        return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+    
+    def _doy_to_month_day(self, doy, year):
+        """Convert day of year to month and day"""
+        days_in_month = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        
+        # Adjust for leap year
+        if self._is_leap_year(year):
+            days_in_month[2] = 29
+        
+        month = 1
+        while doy > days_in_month[month]:
+            doy -= days_in_month[month]
+            month += 1
+            if month > 12:
+                return 1, 1  # Error case
+        
+        return month, doy
+    
+    def _calculate_weekday(self, year, month, day):
+        """Calculate day of week (0=Monday, 6=Sunday)"""
+        if month < 3:
+            month += 12
+            year -= 1
+            
+        k = year % 100
+        j = year // 100
+        
+        day_of_week = (day + 13*(month+1)//5 + k + k//4 + j//4 - 2*j) % 7
+        
+        # Convert from 0=Saturday to 0=Monday
+        return (day_of_week + 5) % 7
+    
+    def set_timezone(self, offset):
+        """Set the timezone offset in hours from UTC"""
+        self.timezone_offset = offset
+        
+        # Update current time with new timezone
+        dt = self.rtc.datetime()
+        hour = (dt[4] - self.timezone_offset + offset) % 24
+        
+        # Apply DST if active
+        if self.time_data['dst'] == 1:
+            hour = (hour - 1) % 24  # Remove current DST adjustment
+        
+        self.rtc.datetime((dt[0], dt[1], dt[2], dt[3], hour, dt[5], dt[6], dt[7]))
+        print(f"Timezone set to UTC{'+' if offset >= 0 else ''}{offset}")
+        
+        # Re-apply DST if active
+        if self.time_data['dst'] == 1:
+            hour = (hour + 1) % 24  # Add DST adjustment again
+            self.rtc.datetime((dt[0], dt[1], dt[2], dt[3], hour, dt[5], dt[6], dt[7]))
+    
+    def get_current_time(self):
+        """Get the current time as a formatted string"""
+        dt = self.rtc.datetime()
+        year, month, day, weekday, hour, minute, second, _ = dt
+        weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        dst_status = ""
+        if self.time_data['dst'] == 1:
+            dst_status = " (DST)"
+        return f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d} {weekday_names[weekday]}{dst_status}"
+    
+    def display_time(self):
+        """Display the current time"""
+        print(self.get_current_time())
+        
+    def get_timezones(self):
+        """Display available US timezones"""
+        timezones = {
+            "EST": -5,
+            "CST": -6,
+            "MST": -7, 
+            "PST": -8,
+            "AKST": -9,
+            "HST": -10
+        }
+        return timezones
+    
+    def run(self):
+        """Main loop to update time and handle signal processing"""
+        last_second = -1
+        while True:
+            current_second = utime.time() % 60
+            if current_second != last_second:
+                last_second = current_second
+                if current_second % 10 == 0:  # Display time every 10 seconds
+                    self.display_time()
+            utime.sleep_ms(100)
+
+
+# Example usage
+if __name__ == "__main__":
+    # Create WWVB decoder with signal on GPIO pin 4 and EST timezone by default
+    clock = WWVBClockDecoder(signal_pin=4, timezone_offset=-5)
+    
+    # Set to another timezone if needed (PST = -8)
+    # clock.set_timezone(-8)
+    
+    # Start the main loop
+    print("WWVB atomic clock decoder started. Waiting for signal...")
+    print(f"Available timezones: {clock.get_timezones()}")
+    clock.run()
