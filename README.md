@@ -1,4 +1,4 @@
-
+CODE IS AI WRITTEN! 
 
 This MicroPython code creates an atomic clock decoder that can receive and interpret time signals from radio-controlled atomic clocks (like WWVB in North America or DCF77 in Europe). Here's what it does:
 
